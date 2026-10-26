@@ -14,21 +14,21 @@ import time
 from pathlib import Path
 
 import torch
-from compressed_tensors.offload import dispatch_model
 from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
 from datasets import Dataset, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from llmcompressor import oneshot
 from llmcompressor.modifiers.gptq import GPTQModifier
-from llmcompressor.modifiers.smoothquant import SmoothQuantModifier
 from llmcompressor.modifiers.transform import SpinQuantModifier
+from llmcompressor.modifiers.transform.smoothquant import SmoothQuantModifier
 
 MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen3-0.6B")
 NUM_CALIB = int(os.environ.get("NUM_CALIB", 128))
 CALIB_LEN = int(os.environ.get("CALIB_LEN", 512))
 EVAL_LEN = int(os.environ.get("EVAL_LEN", 1024))
 EVAL_WINDOWS = int(os.environ.get("EVAL_WINDOWS", 40))
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 OUT = Path(__file__).parent / os.environ.get("OUT", "results.jsonl")
 
@@ -110,10 +110,10 @@ def perplexity(model, ids):
     nll, count = 0.0, 0
     for index in range(EVAL_WINDOWS):
         window = ids[index * EVAL_LEN : (index + 1) * EVAL_LEN].unsqueeze(0)
-        window = window.to(model.device)
+        window = window.to(DEVICE)
         logits = model(window).logits[0, :-1].float()
         nll += torch.nn.functional.cross_entropy(
-            logits, window[0, 1:], reduction="sum"
+            logits, window[0, 1:].to(logits.device), reduction="sum"
         ).item()
         count += window.shape[1] - 1
     return float(torch.exp(torch.tensor(nll / count)))
@@ -121,7 +121,7 @@ def perplexity(model, ids):
 
 def run(name):
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=DTYPE)
+    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=DTYPE).to(DEVICE)
     recipe = CONFIGS[name]()
     start = time.time()
     if recipe is not None:
@@ -133,7 +133,7 @@ def run(name):
             max_seq_length=CALIB_LEN,
         )
     quant_minutes = (time.time() - start) / 60
-    dispatch_model(model)
+    model.to(DEVICE)
     ppl = perplexity(model, wikitext_ids(tokenizer, "test"))
     result = {
         "model": MODEL_ID,
