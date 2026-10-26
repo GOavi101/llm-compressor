@@ -151,6 +151,7 @@ def assign_batches(
     module_list: list[torch.nn.Module],
     batched_quantization: str | int | None,
     block_size: int,
+    solver: str = "gptq",
 ) -> list[list[torch.nn.Module]]:
     """Partition modules into compatible GPTQ execution batches based on
     having the same batch_key.
@@ -171,7 +172,7 @@ def assign_batches(
             pending.setdefault(key, []).append(module)
 
     for members in pending.values():
-        max_batch = max_batch_size(members[0], batched_quantization, block_size)
+        max_batch = max_batch_size(members[0], batched_quantization, block_size, solver)
         for start in range(0, len(members), max_batch):
             batches.append(members[start : start + max_batch])
     return batches
@@ -202,7 +203,10 @@ def batch_key(module: torch.nn.Module) -> tuple | None:
 
 
 def max_batch_size(
-    module: torch.nn.Module, batched_quantization: str | int, block_size: int
+    module: torch.nn.Module,
+    batched_quantization: str | int,
+    block_size: int,
+    solver: str = "gptq",
 ) -> int:
     """Return the safe batch cap for one representative compatible module.
 
@@ -226,7 +230,14 @@ def max_batch_size(
         3 * hessian_size  # original Hessian and both gather outputs
         + 2 * weight_size  # module weight and stacked working weight
     )
-    per_module_bytes = max(quantization_peak, actorder_peak) * 4
+    admm_peak = (
+        3 * hessian_size  # Hessian, eigenvectors, and eigendecomposition workspace
+        + 16 * weight_size  # module weight, effective scales, iterates, and refresh
+    )
+    if solver == "admm":
+        per_module_bytes = admm_peak * 4
+    else:
+        per_module_bytes = max(quantization_peak, actorder_peak) * 4
 
     if torch.device(device).type != "cuda" or not torch.accelerator.is_available():
         return 1

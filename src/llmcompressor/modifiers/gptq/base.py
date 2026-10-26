@@ -24,6 +24,10 @@ from torch import distributed as dist
 
 from llmcompressor.core import Event, State
 from llmcompressor.modifiers import Modifier
+from llmcompressor.modifiers.gptq.admm_quantize import (
+    QParamFitter,
+    admm_quantize_weight,
+)
 from llmcompressor.modifiers.gptq.gptq_quantize import quantize_weight
 from llmcompressor.modifiers.gptq.helpers import (
     accumulate_hessian,
@@ -99,6 +103,19 @@ class GPTQModifier(Modifier, QuantizationMixin):
         linearized MoE experts). ``"auto"`` (the default) limits batches to 75% of
         available CUDA memory. A positive integer sets a maximum batch size without
         consulting available memory. ``None`` disables batching.
+    :param solver: algorithm used to quantize weights from the calibrated Hessian.
+        ``"gptq"`` (the default) quantizes one column at a time. ``"admm"`` uses
+        ADMM-Q (https://arxiv.org/abs/2605.11222), which optimizes all weights
+        jointly. ADMM-Q is slower, but most accurate at 3 bits and below.
+        ``block_size`` and ``actorder`` have no effect on ADMM-Q
+    :param admm_iterations: maximum number of ADMM-Q iterations. Iteration stops
+        early once the quantized weights stop changing
+    :param admm_local_search_rounds: maximum rounds of ADMM-Q pair-swap local
+        search, which refines integer weights one grid step at a time. ``0``
+        disables local search
+    :param admm_grid_refresh: if True, ADMM-Q refits the weight observer once on
+        its continuous iterate and keeps the new grid if it projects the iterate
+        more closely. Grids with a global scale, such as NVFP4, are never refit
 
     :param config_groups: dictionary specifying quantization schemes to apply to target
         modules. Modules not matching a scheme target will NOT be quantized.
@@ -131,6 +148,10 @@ class GPTQModifier(Modifier, QuantizationMixin):
     dampening_frac: float | None = 0.01
     actorder: ActivationOrdering | Sentinel | None = Sentinel("static")
     batched_quantization: Literal["auto"] | StrictInt | None = "auto"
+    solver: Literal["gptq", "admm"] = "gptq"
+    admm_iterations: StrictInt = 300
+    admm_local_search_rounds: StrictInt = 5
+    admm_grid_refresh: bool = False
 
     # private variables
     _module_names: dict[torch.nn.Module, str] = PrivateAttr(default_factory=dict)
@@ -146,6 +167,20 @@ class GPTQModifier(Modifier, QuantizationMixin):
     def _validate_batched_quantization(cls, value):
         if isinstance(value, int) and value <= 0:
             raise ValueError("batched_quantization must be a positive integer")
+        return value
+
+    @field_validator("admm_iterations")
+    @classmethod
+    def _validate_admm_iterations(cls, value):
+        if value <= 0:
+            raise ValueError("admm_iterations must be a positive integer")
+        return value
+
+    @field_validator("admm_local_search_rounds")
+    @classmethod
+    def _validate_admm_local_search_rounds(cls, value):
+        if value < 0:
+            raise ValueError("admm_local_search_rounds must be non-negative")
         return value
 
     def resolve_quantization_config(self) -> QuantizationConfig:
@@ -307,7 +342,7 @@ class GPTQModifier(Modifier, QuantizationMixin):
 
     def compress_module_list(self, module_list):
         for batch in assign_batches(
-            module_list, self.batched_quantization, self.block_size
+            module_list, self.batched_quantization, self.block_size, self.solver
         ):
             quant_args = getattr_chain(batch[0], "quantization_scheme.weights")
             batch_qparams = [module.weight_observer.get_qparams() for module in batch]
@@ -336,18 +371,41 @@ class GPTQModifier(Modifier, QuantizationMixin):
                     ctx_stack.enter_context(CompressionLogger(module))
                     for module in batch
                 ]
-                quantized, losses, used_rtn_fallback = quantize_weight(
-                    weights=weights,
-                    hessians=hessians,
-                    scale=scales,
-                    zero_point=zero_points,
-                    global_scale=global_scales,
-                    quant_args=quant_args,
-                    blocksize=self.block_size,
-                    percdamp=self.dampening_frac,
-                )
+                if self.solver == "admm":
+                    (
+                        quantized,
+                        losses,
+                        used_rtn_fallback,
+                        scales,
+                        zero_points,
+                    ) = admm_quantize_weight(
+                        weights=weights,
+                        hessians=hessians,
+                        scale=scales,
+                        zero_point=zero_points,
+                        global_scale=global_scales,
+                        quant_args=quant_args,
+                        percdamp=self.dampening_frac,
+                        num_iterations=self.admm_iterations,
+                        local_search_rounds=self.admm_local_search_rounds,
+                        fit_qparams=(
+                            _observer_fitter(batch) if self.admm_grid_refresh else None
+                        ),
+                    )
+                else:
+                    quantized, losses, used_rtn_fallback = quantize_weight(
+                        weights=weights,
+                        hessians=hessians,
+                        scale=scales,
+                        zero_point=zero_points,
+                        global_scale=global_scales,
+                        quant_args=quant_args,
+                        blocksize=self.block_size,
+                        percdamp=self.dampening_frac,
+                    )
+                result_name = "ADMM-Q" if self.solver == "admm" else "GPTQ"
                 for index, comp_logger in enumerate(comp_loggers):
-                    comp_logger.set_results(name="GPTQ", loss=losses[index].item())
+                    comp_logger.set_results(name=result_name, loss=losses[index].item())
                     if used_rtn_fallback[index].item():
                         self._rtn_fallback_module_names.append(names[index])
 
@@ -431,3 +489,20 @@ class GPTQModifier(Modifier, QuantizationMixin):
         self._rtn_fallback_module_names = []
 
         return True
+
+
+def _observer_fitter(batch: list[torch.nn.Module]) -> QParamFitter:
+    """Fit qparams to candidate weights with fresh, unfused copies of each
+    module's weight observer, so refit grids keep the observer's clipping"""
+
+    def fit(candidates: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        scales, zero_points = [], []
+        for module, candidate in zip(batch, candidates):
+            source = module.weight_observer
+            observer = type(source)(base_name="weight", args=source.args)
+            qparams = observer(candidate).get_qparams()
+            scales.append(qparams["scale"])
+            zero_points.append(qparams["zero_point"])
+        return torch.stack(scales), torch.stack(zero_points)
+
+    return fit
